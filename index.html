@@ -93,7 +93,7 @@ const { useState, useEffect, useMemo, useRef } = React;
    1) LEVEL A — shared passphrase. Change this, and give it to your circle
       personally. Set it to "" to turn the gate off.
    ══════════════════════════════════════════════════════════════════════════ */
-const APP_PASSPHRASE = "tgt_hifz";
+const APP_PASSPHRASE = "changeme";
 
 /* ══════════════════════════════════════════════════════════════════════════
    2) YOUR CLOUD DATABASE — paste your Firebase config below (see setup guide).
@@ -101,12 +101,12 @@ const APP_PASSPHRASE = "tgt_hifz";
       single-device local mode for testing only.
    ══════════════════════════════════════════════════════════════════════════ */
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyDFHkgweViGTpyWMCRXA7wscKqyTFYaXVw",
-  authDomain: "hifz-group.firebaseapp.com",
-  projectId: "hifz-group",
-  storageBucket: "hifz-group.firebasestorage.app",
-  messagingSenderId: "831824157580",
-  appId: "1:831824157580:web:a2d3679ce2543d66ec54a9"
+  apiKey: "PASTE_apiKey_HERE",
+  authDomain: "PASTE_authDomain_HERE",
+  projectId: "PASTE_projectId_HERE",
+  storageBucket: "PASTE_storageBucket_HERE",
+  messagingSenderId: "PASTE_messagingSenderId_HERE",
+  appId: "PASTE_appId_HERE"
 };
 const FIREBASE_READY = !String(FIREBASE_CONFIG.projectId).includes("PASTE") && !!window.firebase;
 let db=null, auth=null;
@@ -219,13 +219,13 @@ const BOARDS={
 
 /* ══════════════════════════ ROOT: gate → auth → app ══════════════════════════ */
 function Root(){
-  const [gated,setGated]=useState(!APP_PASSPHRASE || sessionStorage.getItem("halaqa_gate")==="ok");
+  const [gated,setGated]=useState(!APP_PASSPHRASE || localStorage.getItem("halaqa_gate")==="ok");
   const [user,setUser]=useState(MODE==="firebase"?undefined:null);
   const [localMe,setLocalMe]=useState(()=>{const m=lsGet(LKEY.me);return m&&m.id?m:null;});
 
   useEffect(()=>{ if(MODE==="firebase") return auth.onAuthStateChanged(u=>setUser(u||null)); },[]);
 
-  if(!gated) return <Gate onPass={()=>{sessionStorage.setItem("halaqa_gate","ok");setGated(true);}}/>;
+  if(!gated) return <Gate onPass={()=>{localStorage.setItem("halaqa_gate","ok");setGated(true);}}/>;
 
   if(MODE==="firebase"){
     if(user===undefined) return <Loading/>;
