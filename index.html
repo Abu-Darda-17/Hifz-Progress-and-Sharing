@@ -93,7 +93,7 @@ const { useState, useEffect, useMemo, useRef } = React;
    1) LEVEL A — shared passphrase. Change this, and give it to your circle
       personally. Set it to "" to turn the gate off.
    ══════════════════════════════════════════════════════════════════════════ */
-const APP_PASSPHRASE = "tgt_hifz";
+const APP_PASSPHRASE = "";
 
 /* ══════════════════════════════════════════════════════════════════════════
    2) YOUR CLOUD DATABASE — paste your Firebase config below (see setup guide).
@@ -317,15 +317,33 @@ function App(props){
   const [loading,setLoading]=useState(true);
   const [tab,setTab]=useState("standings");
   const [focusMember,setFocusMember]=useState(null);
+  const [myComms,setMyComms]=useState([]);
+  const [pubComms,setPubComms]=useState([]);
+  const [selectedCid,setSelectedCid]=useState(()=>localStorage.getItem("halaqa_cid")||null);
+  const [invite,setInvite]=useState(null);
   const fileRef=useRef(null);
+  function chooseCid(cid){setSelectedCid(cid);if(cid)localStorage.setItem("halaqa_cid",cid);else localStorage.removeItem("halaqa_cid");}
 
   useEffect(()=>{
     if(MODE==="firebase"){
       const u1=db.collection("members").onSnapshot(s=>{setMembers(s.docs.map(d=>d.data()));setMembersLoaded(true);});
       const u2=db.collection("logs").onSnapshot(s=>{setLogs(s.docs.map(d=>d.data()));setLoading(false);});
       const u3=db.collection("verifications").onSnapshot(s=>setVerifs(s.docs.map(d=>d.data())));
-      return()=>{u1();u2();u3();};
+      const u4=db.collection("communities").where("members","array-contains",currentUid).onSnapshot(s=>setMyComms(s.docs.map(d=>d.data())));
+      const u5=db.collection("communities").where("visibility","==","public").onSnapshot(s=>setPubComms(s.docs.map(d=>d.data())),()=>{});
+      return()=>{u1();u2();u3();u4();u5();};
     }else{setMembers(lsGet(LKEY.members));setLogs(lsGet(LKEY.logs));setVerifs(lsGet(LKEY.verifs));setMembersLoaded(true);setLoading(false);}
+  },[]);
+
+  useEffect(()=>{
+    if(MODE!=="firebase")return;
+    const p=new URLSearchParams(window.location.search);const cid=p.get("join"),code=p.get("code");
+    if(cid&&code){
+      db.collection("communities").doc(cid).get().then(d=>{
+        if(d.exists){const c=d.data();if(c.inviteCode===code)setInvite(c);}
+        window.history.replaceState({},"",window.location.pathname);
+      }).catch(()=>{});
+    }
   },[]);
 
   const stats=useMemo(()=>{
@@ -333,10 +351,15 @@ function App(props){
     arr.sort((a,b)=>b.memorizedLetters-a.memorizedLetters||b.verifiedLetters-a.verifiedLetters||b.streak-a.streak);
     return arr;
   },[members,logs,verifs]);
-  const groupPct=stats.length?(stats.reduce((t,s)=>t+s.memorizedLetters,0)/(TOTAL_LETTERS*stats.length))*100:0;
-  const champions=useMemo(()=>{const out={};for(const k in BOARDS){const B=BOARDS[k];
-    const active=stats.filter(B.active).sort(B.cmp);if(active.length)out[k]=active[0].id;}return out;},[stats]);
   const me=stats.find(s=>s.id===currentUid);
+  const myName=(me&&me.name)||(members.find(m=>m.id===currentUid)||{}).name||"You";
+
+  const selectedCommunity = myComms.find(c=>c.id===selectedCid) || myComms[0] || null;
+  const commMemberIds = MODE==="firebase" ? (selectedCommunity?selectedCommunity.members:[]) : members.map(m=>m.id);
+  const cStats = stats.filter(s=>commMemberIds.indexOf(s.id)>=0);
+  const cChampions={};for(const k in BOARDS){const B=BOARDS[k];const a=cStats.filter(B.active).sort(B.cmp);if(a.length)cChampions[k]=a[0].id;}
+  const groupPct=cStats.length?(cStats.reduce((t,s)=>t+s.memorizedLetters,0)/(TOTAL_LETTERS*cStats.length))*100:0;
+  const isAdmin=(c)=>c&&(c.admins||[]).indexOf(currentUid)>=0;
 
   async function addLog(entry){const lg={id:uid(),memberId:currentUid,...entry};
     if(MODE==="firebase")await db.collection("logs").doc(lg.id).set(lg);
@@ -355,6 +378,32 @@ function App(props){
     else{const ms=lsGet(LKEY.members).map(m=>m.id===currentUid?{...m,name:name.trim()}:m);setMembers(ms);lsSet(LKEY.members,ms);
       lsSet(LKEY.me,{id:currentUid,name:name.trim()});}}
   function signOut(){ if(MODE==="firebase")auth.signOut(); else {localStorage.removeItem(LKEY.me);location.reload();} }
+
+  const FV=(MODE==="firebase")?firebase.firestore.FieldValue:null;
+  const newCode=()=>Math.random().toString(36).slice(2,8).toUpperCase();
+  async function createCommunity(name,description,visibility,seedAll){
+    const cid=uid(),code=newCode();const mem=[currentUid];
+    if(seedAll)members.forEach(m=>{if(mem.indexOf(m.id)<0)mem.push(m.id);});
+    await db.collection("communities").doc(cid).set({id:cid,name:name.trim(),description:(description||"").trim(),
+      visibility,inviteCode:code,lastJoinCode:code,members:mem,admins:[currentUid],createdBy:currentUid,createdAt:Date.now()});
+    chooseCid(cid);
+  }
+  async function requestJoin(c){await db.collection("communities").doc(c.id).collection("requests").doc(currentUid).set({memberId:currentUid,name:myName,createdAt:Date.now()});}
+  async function cancelRequest(c){await db.collection("communities").doc(c.id).collection("requests").doc(currentUid).delete();}
+  async function approveReq(cid,ruid){await db.collection("communities").doc(cid).update({members:FV.arrayUnion(ruid)});
+    await db.collection("communities").doc(cid).collection("requests").doc(ruid).delete();}
+  async function rejectReq(cid,ruid){await db.collection("communities").doc(cid).collection("requests").doc(ruid).delete();}
+  async function removeMemberFromComm(c,ruid){const admins=(c.admins||[]).filter(x=>x!==ruid);
+    await db.collection("communities").doc(c.id).update({members:FV.arrayRemove(ruid),admins});}
+  async function promoteAdmin(c,ruid){await db.collection("communities").doc(c.id).update({admins:FV.arrayUnion(ruid)});}
+  async function leaveCommunity(c){
+    const remaining=(c.members||[]).filter(x=>x!==currentUid);
+    if(remaining.length===0){await db.collection("communities").doc(c.id).delete();if(selectedCid===c.id)chooseCid(null);return;}
+    let admins=(c.admins||[]).filter(x=>x!==currentUid);if(admins.length===0)admins=[remaining[0]];
+    await db.collection("communities").doc(c.id).update({members:FV.arrayRemove(currentUid),admins});
+    if(selectedCid===c.id)chooseCid(null);
+  }
+  async function joinByInvite(c){await db.collection("communities").doc(c.id).update({members:FV.arrayUnion(currentUid),lastJoinCode:c.inviteCode});chooseCid(c.id);setInvite(null);}
 
   function exportData(){
     const payload={app:"halaqa",version:3,exportedAt:new Date().toISOString(),members,logs,verifications:verifs};
@@ -388,32 +437,45 @@ function App(props){
   const focus=focusMember?stats.find(s=>s.id===focusMember):null;
   const account={onSaveName:saveName,onSignOut:signOut,onExport:exportData,onImport:()=>fileRef.current.click(),email:props.currentEmail};
 
+  const alreadyMember=invite && (invite.members||[]).indexOf(currentUid)>=0;
+
   return(<div className="wrap">
     <header className="top">
       <div style={{display:"flex",alignItems:"center",gap:12}}>
         <Star size={34} fill="var(--em)"/>
-        <div><h1 className="brand">Halaqa</h1><div className="sub">Hifz progress, weighted by length, shared with the circle</div></div>
+        <div><h1 className="brand">Halaqa</h1><div className="sub">{selectedCommunity?selectedCommunity.name:"Hifz progress, weighted by length"}</div></div>
       </div>
-      <div style={{textAlign:"right"}}><div className="big tnum">{groupPct.toFixed(1)}%</div><div className="sub">circle average</div></div>
+      <div style={{textAlign:"right"}}><div className="big tnum">{groupPct.toFixed(1)}%</div><div className="sub">{selectedCommunity?"community average":"—"}</div></div>
     </header>
 
     {MODE==="local" && <div className="banner warn">Local test mode — data stays in this browser only. Add Firebase for real accounts and sharing.</div>}
 
+    {invite && !alreadyMember && <div className="banner" style={{background:"#EAF3EE",border:"1px solid #BEDBCB",color:"var(--ink)"}}>
+      You've been invited to <b>{invite.name}</b>. <button className="btn primary sm" style={{marginLeft:8}} onClick={()=>joinByInvite(invite)}>Join</button>
+      <button className="link" style={{marginLeft:10}} onClick={()=>setInvite(null)}>Dismiss</button></div>}
+    {invite && alreadyMember && <div className="banner warn">You're already a member of {invite.name}. <button className="link" style={{marginLeft:8}} onClick={()=>{chooseCid(invite.id);setInvite(null);setTab("standings");}}>Open it</button></div>}
+
     <nav className="tabs">
-      {[["standings","Standings"],["log","Log entry"],["activity","Activity"],["me","My profile"]].map(t=>(
+      {[["standings","Standings"],["log","Log entry"],["activity","Activity"],["communities","Communities"],["me","My profile"]].map(t=>(
         <button key={t[0]} className={"pill"+((tab===t[0]&&!focus)?" active":"")}
           onClick={()=>{setFocusMember(null);setTab(t[0]);}}>{t[1]}</button>))}
     </nav>
 
     {focus
-      ? <MemberDetail s={focus} isSelf={focus.id===currentUid} champions={champions}
+      ? <MemberDetail s={focus} isSelf={focus.id===currentUid} champions={cChampions}
           onBack={()=>setFocusMember(null)} onRemoveLog={removeLog} onAddVerif={addVerif} onRemoveVerif={removeVerif}/>
       : <React.Fragment>
-        {tab==="standings" && <Standings stats={stats} champions={champions} onOpen={setFocusMember}/>}
+        {tab==="standings" && <Standings stats={cStats} champions={cChampions} community={selectedCommunity}
+            myComms={myComms} onSelect={chooseCid} onGoCommunities={()=>setTab("communities")} onOpen={setFocusMember}/>}
         {tab==="log" && <LogForm me={me} onAdd={addLog} goStandings={()=>setTab("standings")}/>}
-        {tab==="activity" && <Activity logs={logs} members={members} currentUid={currentUid} onRemove={removeLog}/>}
+        {tab==="activity" && <Activity logs={logs.filter(l=>commMemberIds.indexOf(l.memberId)>=0)} members={members} currentUid={currentUid} onRemove={removeLog}/>}
+        {tab==="communities" && <CommunitiesTab currentUid={currentUid} myName={myName} members={members}
+            myComms={myComms} pubComms={pubComms} selectedCid={selectedCommunity?selectedCommunity.id:null} isAdmin={isAdmin}
+            onSelect={(cid)=>{chooseCid(cid);setTab("standings");}} onCreate={createCommunity} onRequestJoin={requestJoin}
+            onCancelRequest={cancelRequest} onLeave={leaveCommunity} onApprove={approveReq} onReject={rejectReq}
+            onRemoveMember={removeMemberFromComm} onPromote={promoteAdmin}/>}
         {tab==="me" && (me
-          ? <MemberDetail s={me} isSelf={true} champions={champions} account={account}
+          ? <MemberDetail s={me} isSelf={true} champions={cChampions} account={account}
               onRemoveLog={removeLog} onAddVerif={addVerif} onRemoveVerif={removeVerif}/>
           : <Loading/>)}
       </React.Fragment>}
@@ -439,7 +501,18 @@ function SetNameScreen(props){
 
 function Standings(props){
   const stats=props.stats;const [board,setBoard]=useState("completion");
-  if(!stats.length)return <Empty title="No one yet" body="Once people sign in and log memorization, the boards fill up here."/>;
+  const comm=props.community;const myComms=props.myComms||[];
+  const Switcher = myComms.length>0 ? (
+    <div className="row" style={{marginBottom:12,gap:8,alignItems:"center"}}>
+      <select className="f" style={{maxWidth:280}} value={comm?comm.id:""} onChange={e=>props.onSelect(e.target.value)}>
+        {myComms.map(c=><option key={c.id} value={c.id}>{c.name}{(c.admins||[]).indexOf(props.currentUid)>=0?"":""}</option>)}
+      </select>
+      <button className="btn sm" onClick={props.onGoCommunities}>Communities</button>
+    </div>) : null;
+  if(!comm && MODE==="firebase")
+    return(<div><Empty title="No community yet" body="Create your own community or join one to see a shared leaderboard. Your personal progress is always on ‘My profile’."/>
+      <div style={{textAlign:"center",marginTop:-4}}><button className="btn primary" onClick={props.onGoCommunities}>Go to Communities</button></div></div>);
+  if(!stats.length)return(<div>{Switcher}<Empty title="Nothing logged here yet" body="Once members of this community log memorization, the boards fill up."/></div>);
   const B=BOARDS[board];const medal=["#C8962B","#9AA0A6","#A9743C"];
   const sorted=[...stats].sort(B.cmp);
   const unitText=(s)=>typeof B.unit==="function"?B.unit(s):B.unit;
@@ -448,6 +521,7 @@ function Standings(props){
   const cVer=stats.reduce((t,s)=>t+s.verifiedLetters,0)/JUZ_UNIT;
   const cMonth=stats.reduce((t,s)=>t+s.new30,0)/JUZ_UNIT;
   return(<div>
+    {Switcher}
     <div className="card" style={{display:"flex",flexWrap:"wrap",gap:"8px 22px",padding:"14px 18px"}}>
       <span style={{fontSize:13}}><b className="serif tnum" style={{color:"var(--ink)"}}>{cTotal.toFixed(1)}</b> <span className="muted">juz memorized together</span></span>
       <span style={{fontSize:13}}><b className="serif tnum" style={{color:"var(--brass)"}}>{cVer.toFixed(1)}</b> <span className="muted">juz verified ✓</span></span>
@@ -675,6 +749,120 @@ function Activity(props){
       </div>
       {own && <button className="link" onClick={()=>{if(confirm("Delete this entry?"))props.onRemove(l.id);}} aria-label="Delete">✕</button>}
     </div>);})}</div>);
+}
+
+function inviteLink(c){return window.location.origin+window.location.pathname+"?join="+c.id+"&code="+c.inviteCode;}
+
+function CommunitiesTab(props){
+  const {currentUid,myComms,pubComms,members,isAdmin}=props;
+  const [openAdmin,setOpenAdmin]=useState(null);
+  const [requested,setRequested]=useState({}); // cid -> true (this session)
+  const nameOf=(id)=>(members.find(m=>m.id===id)||{}).name||"Member";
+  const myIds=myComms.map(c=>c.id);
+  const discover=pubComms.filter(c=>myIds.indexOf(c.id)<0);
+
+  return(<div>
+    {/* Your communities */}
+    <div className="card">
+      <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 4px"}}>Your communities</h3>
+      {myComms.length===0 && <div className="muted" style={{fontSize:13,marginBottom:6}}>You're not in any community yet. Create one below, or join a public one.</div>}
+      {myComms.map(c=>{const admin=isAdmin(c);const active=props.selectedCid===c.id;
+        return(<div key={c.id} style={{borderBottom:"1px solid var(--line)",padding:"10px 0"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            <button className="btn sm" style={active?{background:"var(--em)",color:"var(--parch)",borderColor:"var(--em)"}:{}} onClick={()=>props.onSelect(c.id)}>{active?"Viewing":"View"}</button>
+            <span className="serif" style={{color:"var(--ink)",fontSize:16}}>{c.name}</span>
+            <span className="muted" style={{fontSize:11,border:"1px solid var(--line)",borderRadius:999,padding:"1px 8px"}}>{c.visibility}</span>
+            {admin && <span style={{fontSize:11,color:"var(--brass)",border:"1px solid var(--brass2)",borderRadius:999,padding:"1px 8px"}}>admin</span>}
+            <span className="muted" style={{fontSize:12}}>{(c.members||[]).length} member{(c.members||[]).length===1?"":"s"}</span>
+            <span style={{marginLeft:"auto",display:"flex",gap:10}}>
+              {admin && <button className="link" onClick={()=>setOpenAdmin(openAdmin===c.id?null:c.id)}>{openAdmin===c.id?"Close":"Manage"}</button>}
+              <button className="link" style={{color:"var(--danger)"}} onClick={()=>{if(confirm("Leave "+c.name+"?"+(isAdmin(c)&&(c.admins||[]).length===1?" Admin will pass to the next member.":"")))props.onLeave(c);}}>Leave</button>
+            </span>
+          </div>
+          {c.description && <div className="muted" style={{fontSize:12,marginTop:4}}>{c.description}</div>}
+          <InviteBox c={c}/>
+          {admin && openAdmin===c.id && <AdminPanel c={c} currentUid={currentUid} nameOf={nameOf}
+            onApprove={props.onApprove} onReject={props.onReject} onRemoveMember={props.onRemoveMember} onPromote={props.onPromote}/>}
+        </div>);})}
+    </div>
+
+    {/* Create */}
+    <CreateCommunity canSeed={myComms.length===0} memberCount={members.length} onCreate={props.onCreate}/>
+
+    {/* Discover */}
+    <div className="card">
+      <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 4px"}}>Discover public communities</h3>
+      {discover.length===0 && <div className="muted" style={{fontSize:13}}>No public communities to join right now.</div>}
+      {discover.map(c=>(<div key={c.id} style={{borderBottom:"1px solid var(--line)",padding:"10px 0",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div className="serif" style={{color:"var(--ink)",fontSize:16}}>{c.name}</div>
+          {c.description && <div className="muted" style={{fontSize:12}}>{c.description}</div>}
+          <div className="muted" style={{fontSize:11}}>{(c.members||[]).length} members</div>
+        </div>
+        {requested[c.id]
+          ? <button className="btn sm" onClick={()=>{props.onCancelRequest(c);setRequested(r=>({...r,[c.id]:false}));}}>Requested — cancel</button>
+          : <button className="btn primary sm" onClick={()=>{props.onRequestJoin(c);setRequested(r=>({...r,[c.id]:true}));}}>Request to join</button>}
+      </div>))}
+      <div className="muted" style={{fontSize:11,marginTop:8,lineHeight:1.5}}>Secret communities don't appear here — you can only join them through an invite link. Public ones require an admin to approve your request.</div>
+    </div>
+  </div>);
+}
+
+function CreateCommunity(props){
+  const [name,setName]=useState("");const [desc,setDesc]=useState("");const [vis,setVis]=useState("secret");const [seed,setSeed]=useState(false);const [busy,setBusy]=useState(false);
+  async function go(){if(!name.trim())return;setBusy(true);try{await props.onCreate(name,desc,vis,seed);setName("");setDesc("");setSeed(false);}catch(e){alert(e.message||e);}setBusy(false);}
+  return(<div className="card">
+    <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 12px"}}>Create a community</h3>
+    <label className="lb">Name</label>
+    <input className="f" style={{marginBottom:12}} value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Our Circle"/>
+    <label className="lb">Description (shown to people deciding whether to join)</label>
+    <input className="f" style={{marginBottom:12}} value={desc} onChange={e=>setDesc(e.target.value)}/>
+    <label className="lb">Visibility</label>
+    <select className="f" style={{marginBottom:12}} value={vis} onChange={e=>setVis(e.target.value)}>
+      <option value="secret">Secret — hidden; join only by invite link</option>
+      <option value="public">Public — discoverable; join by request + admin approval</option>
+    </select>
+    {props.canSeed && <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,marginBottom:12,color:"var(--text)"}}>
+      <input type="checkbox" checked={seed} onChange={e=>setSeed(e.target.checked)}/>
+      Add all {props.memberCount} current app users to this community (use this for your starting community)
+    </label>}
+    <button className="btn primary" disabled={busy||!name.trim()} onClick={go}>{busy?"…":"Create community"}</button>
+  </div>);
+}
+
+function InviteBox(props){
+  const c=props.c;const [copied,setCopied]=useState(false);const link=inviteLink(c);
+  function copy(){try{navigator.clipboard.writeText(link);setCopied(true);setTimeout(()=>setCopied(false),1500);}catch(e){}}
+  return(<div style={{marginTop:8,background:"var(--parch)",border:"1px solid var(--line)",borderRadius:8,padding:"8px 10px"}}>
+    <div className="muted" style={{fontSize:11,marginBottom:4}}>Invite link · code <b style={{color:"var(--brass)"}}>{c.inviteCode}</b></div>
+    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+      <input className="f" readOnly value={link} style={{fontSize:11,padding:"6px 8px"}} onFocus={e=>e.target.select()}/>
+      <button className="btn sm" onClick={copy}>{copied?"Copied":"Copy"}</button>
+    </div>
+  </div>);
+}
+
+function AdminPanel(props){
+  const c=props.c;const [reqs,setReqs]=useState([]);
+  useEffect(()=>{ if(MODE!=="firebase")return;
+    return db.collection("communities").doc(c.id).collection("requests").onSnapshot(s=>setReqs(s.docs.map(d=>d.data())),()=>{});
+  },[c.id]);
+  const admins=c.admins||[];const memberIds=c.members||[];
+  return(<div style={{marginTop:10,background:"var(--parch)",border:"1px solid var(--line)",borderRadius:10,padding:12}}>
+    <div className="serif" style={{color:"var(--ink)",fontSize:15,marginBottom:6}}>Join requests</div>
+    {reqs.length===0 && <div className="muted" style={{fontSize:12,marginBottom:8}}>No pending requests.</div>}
+    {reqs.map(r=>(<div key={r.memberId} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}>
+      <span style={{flex:1,fontSize:13}}>{r.name||props.nameOf(r.memberId)}</span>
+      <button className="btn primary sm" onClick={()=>props.onApprove(c.id,r.memberId)}>Approve</button>
+      <button className="btn sm" style={{color:"var(--danger)"}} onClick={()=>props.onReject(c.id,r.memberId)}>Reject</button>
+    </div>))}
+    <div className="serif" style={{color:"var(--ink)",fontSize:15,margin:"12px 0 6px"}}>Members</div>
+    {memberIds.map(mid=>(<div key={mid} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}>
+      <span style={{flex:1,fontSize:13}}>{props.nameOf(mid)}{admins.indexOf(mid)>=0 && <span style={{color:"var(--brass)",fontSize:11}}> · admin</span>}{mid===props.currentUid && <span className="muted" style={{fontSize:11}}> · you</span>}</span>
+      {admins.indexOf(mid)<0 && <button className="btn sm" onClick={()=>props.onPromote(c,mid)}>Make admin</button>}
+      {mid!==props.currentUid && <button className="btn sm" style={{color:"var(--danger)"}} onClick={()=>{if(confirm("Remove "+props.nameOf(mid)+"?"))props.onRemoveMember(c,mid);}}>Remove</button>}
+    </div>))}
+  </div>);
 }
 
 function Empty(props){
