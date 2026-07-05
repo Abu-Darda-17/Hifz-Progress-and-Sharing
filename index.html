@@ -207,10 +207,6 @@ const BOARDS={
     cmp:(a,b)=>b.streak-a.streak||b.activeDays-a.activeDays||b.memorizedLetters-a.memorizedLetters,
     value:(s)=>String(s.streak),unit:s=>"day"+(s.streak===1?"":"s")+" 🔥",active:(s)=>s.streak>0,
     sub:(s)=>s.activeDays+" active day"+(s.activeDays===1?"":"s")+(s.lastActive?" · last "+prettyDate(s.lastActive):"")},
-  revision:{label:"Revision",blurb:"Most murāja'ah — keeping what's memorized alive.",
-    cmp:(a,b)=>b.revisedLetters-a.revisedLetters||b.revSessions-a.revSessions,
-    value:(s)=>(s.revisedLetters/JUZ_UNIT).toFixed(1),unit:"juz revised",active:(s)=>s.revisedLetters>0,
-    sub:(s)=>s.revSessions+" session"+(s.revSessions===1?"":"s")+(s.lastRevised?" · last "+prettyDate(s.lastRevised):"")},
   momentum:{label:"This month",blurb:"New memorization in the last 30 days — anyone can lead here.",
     cmp:(a,b)=>b.new30-a.new30||b.new7-a.new7,
     value:(s)=>(s.new30/JUZ_UNIT).toFixed(1),unit:"juz this month",active:(s)=>s.new30>0,
@@ -319,8 +315,11 @@ function App(props){
   const [focusMember,setFocusMember]=useState(null);
   const [myComms,setMyComms]=useState([]);
   const [pubComms,setPubComms]=useState([]);
+  const [events,setEvents]=useState([]);
   const [selectedCid,setSelectedCid]=useState(()=>localStorage.getItem("halaqa_cid")||null);
   const [invite,setInvite]=useState(null);
+  const [inviteBad,setInviteBad]=useState(false);
+  const [bellOpen,setBellOpen]=useState(false);
   const fileRef=useRef(null);
   function chooseCid(cid){setSelectedCid(cid);if(cid)localStorage.setItem("halaqa_cid",cid);else localStorage.removeItem("halaqa_cid");}
 
@@ -331,7 +330,8 @@ function App(props){
       const u3=db.collection("verifications").onSnapshot(s=>setVerifs(s.docs.map(d=>d.data())));
       const u4=db.collection("communities").where("members","array-contains",currentUid).onSnapshot(s=>setMyComms(s.docs.map(d=>d.data())));
       const u5=db.collection("communities").where("visibility","==","public").onSnapshot(s=>setPubComms(s.docs.map(d=>d.data())),()=>{});
-      return()=>{u1();u2();u3();u4();u5();};
+      const u6=db.collection("events").orderBy("createdAt","desc").limit(80).onSnapshot(s=>setEvents(s.docs.map(d=>d.data())),()=>{});
+      return()=>{u1();u2();u3();u4();u5();u6();};
     }else{setMembers(lsGet(LKEY.members));setLogs(lsGet(LKEY.logs));setVerifs(lsGet(LKEY.verifs));setMembersLoaded(true);setLoading(false);}
   },[]);
 
@@ -340,7 +340,10 @@ function App(props){
     const p=new URLSearchParams(window.location.search);const cid=p.get("join"),code=p.get("code");
     if(cid&&code){
       db.collection("communities").doc(cid).get().then(d=>{
-        if(d.exists){const c=d.data();if(c.inviteCode===code)setInvite(c);}
+        if(d.exists){const c=d.data();
+          if(c.inviteCode===code && c.inviteExpiresAt && Date.now()<c.inviteExpiresAt) setInvite(c);
+          else setInviteBad(true);
+        } else setInviteBad(true);
         window.history.replaceState({},"",window.location.pathname);
       }).catch(()=>{});
     }
@@ -352,7 +355,10 @@ function App(props){
     return arr;
   },[members,logs,verifs]);
   const me=stats.find(s=>s.id===currentUid);
-  const myName=(me&&me.name)||(members.find(m=>m.id===currentUid)||{}).name||"You";
+  const myMember=members.find(m=>m.id===currentUid)||{};
+  const myName=(me&&me.name)||myMember.name||"You";
+  const prefs=Object.assign({newMem:true,juz:true,join:true,milestone:true},myMember.notifPrefs||{});
+  const seenAt=myMember.notifSeenAt||0;
 
   const selectedCommunity = myComms.find(c=>c.id===selectedCid) || myComms[0] || null;
   const commMemberIds = MODE==="firebase" ? (selectedCommunity?selectedCommunity.members:[]) : members.map(m=>m.id);
@@ -361,9 +367,32 @@ function App(props){
   const groupPct=cStats.length?(cStats.reduce((t,s)=>t+s.memorizedLetters,0)/(TOTAL_LETTERS*cStats.length))*100:0;
   const isAdmin=(c)=>c&&(c.admins||[]).indexOf(currentUid)>=0;
 
+  const myCommIds=myComms.map(c=>c.id);
+  const prefKey={new:"newMem",juz:"juz",surah:"milestone",full:"milestone",join:"join"};
+  const myEvents=events.filter(e=>e.actorId!==currentUid
+      && (e.communityIds||[]).some(id=>myCommIds.indexOf(id)>=0)
+      && prefs[prefKey[e.type]]!==false);
+  const unread=myEvents.filter(e=>e.createdAt>seenAt).length;
+
+  async function emitEvent(type,text,cids){
+    if(MODE!=="firebase")return;
+    const ids=cids||myComms.map(c=>c.id);if(!ids.length)return;
+    const ev={id:uid(),actorId:currentUid,actorName:myName,type,text,communityIds:ids,createdAt:Date.now()};
+    try{await db.collection("events").doc(ev.id).set(ev);}catch(e){}
+  }
   async function addLog(entry){const lg={id:uid(),memberId:currentUid,...entry};
     if(MODE==="firebase")await db.collection("logs").doc(lg.id).set(lg);
-    else{const n=[...logs,lg];setLogs(n);lsSet(LKEY.logs,n);}}
+    else{const n=[...logs,lg];setLogs(n);lsSet(LKEY.logs,n);}
+    if(entry.type==="new"){
+      const mineOld=logs.filter(l=>l.memberId===currentUid);
+      const before=computeMember({id:currentUid},mineOld,[]);
+      const after=computeMember({id:currentUid},[...mineOld,lg],[]);
+      emitEvent("new","memorized "+NAMES[lg.surah-1]+" "+lg.from+(lg.to!==lg.from?"–"+lg.to:""));
+      for(let s=1;s<=114;s++){if(after.surahPct[s].pct>=0.999&&before.surahPct[s].pct<0.999&&AYAHS[s-1]>12)emitEvent("surah","completed Surah "+NAMES[s-1]);}
+      after.juzFrac.forEach((f,j)=>{if(f>=0.999&&before.juzFrac[j]<0.999)emitEvent("juz","completed Juz "+(j+1));});
+      if(after.pct>=99.999&&before.pct<99.999)emitEvent("full","completed the whole Quran — full Hifz, mā shāʾ Allāh");
+    }
+  }
   async function removeLog(id){
     if(MODE==="firebase")await db.collection("logs").doc(id).delete();
     else{const n=logs.filter(l=>l.id!==id);setLogs(n);lsSet(LKEY.logs,n);}}
@@ -380,30 +409,42 @@ function App(props){
   function signOut(){ if(MODE==="firebase")auth.signOut(); else {localStorage.removeItem(LKEY.me);location.reload();} }
 
   const FV=(MODE==="firebase")?firebase.firestore.FieldValue:null;
+  const WEEK=7*24*60*60*1000;
   const newCode=()=>Math.random().toString(36).slice(2,8).toUpperCase();
+  async function saveNotifPrefs(np){ if(MODE==="firebase")await db.collection("members").doc(currentUid).set({notifPrefs:np},{merge:true}); }
+  async function markNotifSeen(){ if(MODE==="firebase")await db.collection("members").doc(currentUid).set({notifSeenAt:Date.now()},{merge:true}); }
   async function createCommunity(name,description,visibility,seedAll){
     const cid=uid(),code=newCode();const mem=[currentUid];
     if(seedAll)members.forEach(m=>{if(mem.indexOf(m.id)<0)mem.push(m.id);});
     await db.collection("communities").doc(cid).set({id:cid,name:name.trim(),description:(description||"").trim(),
-      visibility,inviteCode:code,lastJoinCode:code,members:mem,admins:[currentUid],createdBy:currentUid,createdAt:Date.now()});
+      visibility,inviteCode:code,inviteExpiresAt:Date.now()+WEEK,lastJoinCode:code,members:mem,admins:[currentUid],createdBy:currentUid,createdAt:Date.now()});
     chooseCid(cid);
   }
-  async function requestJoin(c){await db.collection("communities").doc(c.id).collection("requests").doc(currentUid).set({memberId:currentUid,name:myName,createdAt:Date.now()});}
-  async function cancelRequest(c){await db.collection("communities").doc(c.id).collection("requests").doc(currentUid).delete();}
-  async function approveReq(cid,ruid){await db.collection("communities").doc(cid).update({members:FV.arrayUnion(ruid)});
-    await db.collection("communities").doc(cid).collection("requests").doc(ruid).delete();}
-  async function rejectReq(cid,ruid){await db.collection("communities").doc(cid).collection("requests").doc(ruid).delete();}
-  async function removeMemberFromComm(c,ruid){const admins=(c.admins||[]).filter(x=>x!==ruid);
-    await db.collection("communities").doc(c.id).update({members:FV.arrayRemove(ruid),admins});}
-  async function promoteAdmin(c,ruid){await db.collection("communities").doc(c.id).update({admins:FV.arrayUnion(ruid)});}
+  async function setVisibility(c,vis){ await db.collection("communities").doc(c.id).update({visibility:vis}); }
+  async function regenInvite(c){ await db.collection("communities").doc(c.id).update({inviteCode:newCode(),inviteExpiresAt:Date.now()+WEEK}); }
+  async function revokeInvite(c){ await db.collection("communities").doc(c.id).update({inviteExpiresAt:0}); }
+  async function requestJoin(c){ await db.collection("communities").doc(c.id).collection("requests").doc(currentUid).set({memberId:currentUid,name:myName,createdAt:Date.now()}); }
+  async function cancelRequest(c){ await db.collection("communities").doc(c.id).collection("requests").doc(currentUid).delete(); }
+  async function approveReq(cid,ruid){ await db.collection("communities").doc(cid).update({members:FV.arrayUnion(ruid)});
+    await db.collection("communities").doc(cid).collection("requests").doc(ruid).delete();
+    const nm=(members.find(m=>m.id===ruid)||{}).name||"A member";
+    const ev={id:uid(),actorId:ruid,actorName:nm,type:"join",text:"joined the community",communityIds:[cid],createdAt:Date.now()};
+    try{await db.collection("events").doc(ev.id).set(ev);}catch(e){} }
+  async function rejectReq(cid,ruid){ await db.collection("communities").doc(cid).collection("requests").doc(ruid).delete(); }
+  async function removeMemberFromComm(c,ruid){ const admins=(c.admins||[]).filter(x=>x!==ruid);
+    await db.collection("communities").doc(c.id).update({members:FV.arrayRemove(ruid),admins}); }
+  async function promoteAdmin(c,ruid){ await db.collection("communities").doc(c.id).update({admins:FV.arrayUnion(ruid)}); }
   async function leaveCommunity(c){
     const remaining=(c.members||[]).filter(x=>x!==currentUid);
-    if(remaining.length===0){await db.collection("communities").doc(c.id).delete();if(selectedCid===c.id)chooseCid(null);return;}
-    let admins=(c.admins||[]).filter(x=>x!==currentUid);if(admins.length===0)admins=[remaining[0]];
+    if(remaining.length===0){ await db.collection("communities").doc(c.id).delete(); if(selectedCid===c.id)chooseCid(null); return; }
+    let admins=(c.admins||[]).filter(x=>x!==currentUid); if(admins.length===0)admins=[remaining[0]];
     await db.collection("communities").doc(c.id).update({members:FV.arrayRemove(currentUid),admins});
     if(selectedCid===c.id)chooseCid(null);
   }
-  async function joinByInvite(c){await db.collection("communities").doc(c.id).update({members:FV.arrayUnion(currentUid),lastJoinCode:c.inviteCode});chooseCid(c.id);setInvite(null);}
+  async function joinByInvite(c){
+    await db.collection("communities").doc(c.id).update({members:FV.arrayUnion(currentUid),lastJoinCode:c.inviteCode});
+    emitEvent("join","joined the community",[c.id]); chooseCid(c.id); setInvite(null);
+  }
 
   function exportData(){
     const payload={app:"halaqa",version:3,exportedAt:new Date().toISOString(),members,logs,verifications:verifs};
@@ -435,8 +476,7 @@ function App(props){
     return <SetNameScreen onSet={saveName}/>;
 
   const focus=focusMember?stats.find(s=>s.id===focusMember):null;
-  const account={onSaveName:saveName,onSignOut:signOut,onExport:exportData,onImport:()=>fileRef.current.click(),email:props.currentEmail};
-
+  const account={onSaveName:saveName,onSignOut:signOut,onExport:exportData,onImport:()=>fileRef.current.click(),email:props.currentEmail,prefs:prefs,onSavePrefs:saveNotifPrefs};
   const alreadyMember=invite && (invite.members||[]).indexOf(currentUid)>=0;
 
   return(<div className="wrap">
@@ -445,7 +485,11 @@ function App(props){
         <Star size={34} fill="var(--em)"/>
         <div><h1 className="brand">Halaqa</h1><div className="sub">{selectedCommunity?selectedCommunity.name:"Hifz progress, weighted by length"}</div></div>
       </div>
-      <div style={{textAlign:"right"}}><div className="big tnum">{groupPct.toFixed(1)}%</div><div className="sub">{selectedCommunity?"community average":"—"}</div></div>
+      <div style={{display:"flex",alignItems:"center",gap:14}}>
+        <Bell events={myEvents} unread={unread} open={bellOpen}
+          onToggle={()=>{const nx=!bellOpen;setBellOpen(nx);if(nx)markNotifSeen();}}/>
+        <div style={{textAlign:"right"}}><div className="big tnum">{groupPct.toFixed(1)}%</div><div className="sub">{selectedCommunity?"community avg":"—"}</div></div>
+      </div>
     </header>
 
     {MODE==="local" && <div className="banner warn">Local test mode — data stays in this browser only. Add Firebase for real accounts and sharing.</div>}
@@ -453,27 +497,29 @@ function App(props){
     {invite && !alreadyMember && <div className="banner" style={{background:"#EAF3EE",border:"1px solid #BEDBCB",color:"var(--ink)"}}>
       You've been invited to <b>{invite.name}</b>. <button className="btn primary sm" style={{marginLeft:8}} onClick={()=>joinByInvite(invite)}>Join</button>
       <button className="link" style={{marginLeft:10}} onClick={()=>setInvite(null)}>Dismiss</button></div>}
-    {invite && alreadyMember && <div className="banner warn">You're already a member of {invite.name}. <button className="link" style={{marginLeft:8}} onClick={()=>{chooseCid(invite.id);setInvite(null);setTab("standings");}}>Open it</button></div>}
+    {invite && alreadyMember && <div className="banner warn">You're already in {invite.name}. <button className="link" style={{marginLeft:8}} onClick={()=>{chooseCid(invite.id);setInvite(null);setTab("standings");}}>Open it</button></div>}
+    {inviteBad && <div className="banner warn">That invite link has expired or is invalid. Ask an admin for a fresh one. <button className="link" style={{marginLeft:8}} onClick={()=>setInviteBad(false)}>Dismiss</button></div>}
 
     <nav className="tabs">
       {[["standings","Standings"],["log","Log entry"],["activity","Activity"],["communities","Communities"],["me","My profile"]].map(t=>(
         <button key={t[0]} className={"pill"+((tab===t[0]&&!focus)?" active":"")}
-          onClick={()=>{setFocusMember(null);setTab(t[0]);}}>{t[1]}</button>))}
+          onClick={()=>{setFocusMember(null);setBellOpen(false);setTab(t[0]);}}>{t[1]}</button>))}
     </nav>
 
     {focus
       ? <MemberDetail s={focus} isSelf={focus.id===currentUid} champions={cChampions}
           onBack={()=>setFocusMember(null)} onRemoveLog={removeLog} onAddVerif={addVerif} onRemoveVerif={removeVerif}/>
       : <React.Fragment>
-        {tab==="standings" && <Standings stats={cStats} champions={cChampions} community={selectedCommunity}
+        {tab==="standings" && <Standings stats={cStats} champions={cChampions} community={selectedCommunity} currentUid={currentUid}
             myComms={myComms} onSelect={chooseCid} onGoCommunities={()=>setTab("communities")} onOpen={setFocusMember}/>}
-        {tab==="log" && <LogForm me={me} onAdd={addLog} goStandings={()=>setTab("standings")}/>}
+        {tab==="log" && <LogForm me={me} onAdd={addLog} onAddVerif={addVerif} goStandings={()=>setTab("standings")}/>}
         {tab==="activity" && <Activity logs={logs.filter(l=>commMemberIds.indexOf(l.memberId)>=0)} members={members} currentUid={currentUid} onRemove={removeLog}/>}
         {tab==="communities" && <CommunitiesTab currentUid={currentUid} myName={myName} members={members}
             myComms={myComms} pubComms={pubComms} selectedCid={selectedCommunity?selectedCommunity.id:null} isAdmin={isAdmin}
             onSelect={(cid)=>{chooseCid(cid);setTab("standings");}} onCreate={createCommunity} onRequestJoin={requestJoin}
             onCancelRequest={cancelRequest} onLeave={leaveCommunity} onApprove={approveReq} onReject={rejectReq}
-            onRemoveMember={removeMemberFromComm} onPromote={promoteAdmin}/>}
+            onRemoveMember={removeMemberFromComm} onPromote={promoteAdmin} onSetVisibility={setVisibility}
+            onRegenInvite={regenInvite} onRevokeInvite={revokeInvite}/>}
         {tab==="me" && (me
           ? <MemberDetail s={me} isSelf={true} champions={cChampions} account={account}
               onRemoveLog={removeLog} onAddVerif={addVerif} onRemoveVerif={removeVerif}/>
@@ -505,7 +551,7 @@ function Standings(props){
   const Switcher = myComms.length>0 ? (
     <div className="row" style={{marginBottom:12,gap:8,alignItems:"center"}}>
       <select className="f" style={{maxWidth:280}} value={comm?comm.id:""} onChange={e=>props.onSelect(e.target.value)}>
-        {myComms.map(c=><option key={c.id} value={c.id}>{c.name}{(c.admins||[]).indexOf(props.currentUid)>=0?"":""}</option>)}
+        {myComms.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
       </select>
       <button className="btn sm" onClick={props.onGoCommunities}>Communities</button>
     </div>) : null;
@@ -627,6 +673,21 @@ function AccountCard(props){
       <button className="btn sm" onClick={acc.onImport}>Import my backup</button>
       <button className="btn sm" style={{marginLeft:"auto",color:"var(--danger)"}} onClick={acc.onSignOut}>Sign out</button>
     </div>
+    <NotifSettings prefs={acc.prefs} onSave={acc.onSavePrefs}/>
+  </div>);
+}
+
+function NotifSettings(props){
+  const [p,setP]=useState(Object.assign({newMem:true,juz:true,join:true,milestone:true},props.prefs||{}));
+  const rows=[["newMem","Someone logs new memorization"],["juz","Someone completes a juz"],
+    ["join","Someone joins the community"],["milestone","A milestone (surah, juz, or full Hifz)"]];
+  function toggle(k){const np={...p,[k]:!p[k]};setP(np);props.onSave(np);}
+  return(<div style={{marginTop:14,borderTop:"1px solid var(--line)",paddingTop:12}}>
+    <div className="serif" style={{color:"var(--ink)",fontSize:14,marginBottom:6}}>Notify me about</div>
+    {rows.map(r=>(<label key={r[0]} style={{display:"flex",alignItems:"center",gap:8,fontSize:13,padding:"3px 0",color:"var(--text)"}}>
+      <input type="checkbox" checked={p[r[0]]!==false} onChange={()=>toggle(r[0])}/>{r[1]}
+    </label>))}
+    <div className="muted" style={{fontSize:11,marginTop:4}}>Shown in the bell at the top when the app is open.</div>
   </div>);
 }
 
@@ -689,12 +750,15 @@ function LogForm(props){
   const [type,setType]=useState("new");const [surah,setSurah]=useState(1);
   const [from,setFrom]=useState(1);const [to,setTo]=useState(AYAHS[0]);
   const [date,setDate]=useState(todayStr());const [err,setErr]=useState("");const [savedInfo,setSavedInfo]=useState(null);
+  const [alsoVerified,setAlsoVerified]=useState(false);const [verBy,setVerBy]=useState("");
   const maxA=AYAHS[surah-1];
   function goSurah(n){n=Math.min(114,Math.max(1,n));setSurah(n);setFrom(1);setTo(AYAHS[n-1]);setSavedInfo(null);setErr("");}
   function submit(){setErr("");const f=Number(from),t=Number(to);
     if(!f||!t||f<1||t<1||f>maxA||t>maxA)return setErr("Ayah must be between 1 and "+maxA+" for "+NAMES[surah-1]+".");
     if(f>t)return setErr("The starting ayah can't be after the ending ayah.");
-    props.onAdd({type,surah,from:f,to:t,date});setSavedInfo({surah});}
+    props.onAdd({type,surah,from:f,to:t,date});
+    if(type==="new"&&alsoVerified&&props.onAddVerif)props.onAddVerif({surah,from:f,to:t,by:verBy.trim(),date});
+    setSavedInfo({surah});setAlsoVerified(false);setVerBy("");}
   return(<div className="card">
     <h2 className="serif" style={{color:"var(--ink)",fontSize:20,margin:"0 0 4px"}}>Log a portion</h2>
     <div className="muted" style={{fontSize:12,marginBottom:16}}>Logging for <b style={{color:"var(--text)"}}>{me?me.name:"you"}</b> — only you can add to your own record.</div>
@@ -719,6 +783,13 @@ function LogForm(props){
     <button className="btn sm" style={{color:"var(--em)",marginBottom:16}} onClick={()=>{setFrom(1);setTo(maxA);}}>Whole surah</button>
     <label className="lb">Date</label>
     <input className="f" style={{marginBottom:16}} type="date" max={todayStr()} value={date} onChange={e=>setDate(e.target.value)}/>
+    {type==="new" && <div style={{marginBottom:16,padding:"10px 12px",background:"var(--parch)",border:"1px solid var(--line)",borderRadius:8}}>
+      <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"var(--text)"}}>
+        <input type="checkbox" checked={alsoVerified} onChange={e=>setAlsoVerified(e.target.checked)}/>
+        ✓ Also mark this range as verified by my teacher
+      </label>
+      {alsoVerified && <input className="f" style={{marginTop:8,fontSize:13}} value={verBy} placeholder="Verified by (teacher / mosque — optional)" onChange={e=>setVerBy(e.target.value)}/>}
+    </div>}
     {err && <div style={{color:"var(--danger)",fontSize:12,marginBottom:12}}>{err}</div>}
     {!savedInfo
       ? <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -751,18 +822,38 @@ function Activity(props){
     </div>);})}</div>);
 }
 
+function Bell(props){
+  const {events,unread,open}=props;
+  return(<div style={{position:"relative"}}>
+    <button onClick={props.onToggle} title="Notifications" style={{background:"none",border:"none",cursor:"pointer",position:"relative",padding:4}}>
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--ink)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+      {unread>0 && <span style={{position:"absolute",top:0,right:0,background:"var(--danger)",color:"#fff",fontSize:10,
+        minWidth:16,height:16,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px"}}>{unread>9?"9+":unread}</span>}
+    </button>
+    {open && <div style={{position:"absolute",right:0,top:34,width:300,maxHeight:360,overflowY:"auto",zIndex:20,
+      background:"var(--card)",border:"1px solid var(--line)",borderRadius:12,boxShadow:"0 6px 24px rgba(0,0,0,.12)",padding:8}}>
+      <div className="serif" style={{color:"var(--ink)",fontSize:15,padding:"4px 8px 8px"}}>Notifications</div>
+      {events.length===0 && <div className="muted" style={{fontSize:13,padding:"8px"}}>Nothing yet. Activity from your communities appears here.</div>}
+      {events.slice(0,40).map(e=>(<div key={e.id} style={{padding:"8px",borderTop:"1px solid var(--line)",fontSize:13}}>
+        <b className="serif" style={{color:"var(--ink)"}}>{e.actorName}</b> {e.text}
+        <div className="muted" style={{fontSize:11,marginTop:2}}>{prettyDate((new Date(e.createdAt)).toISOString().slice(0,10))}</div>
+      </div>))}
+    </div>}
+  </div>);
+}
+
 function inviteLink(c){return window.location.origin+window.location.pathname+"?join="+c.id+"&code="+c.inviteCode;}
+function inviteActive(c){return c.inviteExpiresAt && Date.now()<c.inviteExpiresAt;}
 
 function CommunitiesTab(props){
   const {currentUid,myComms,pubComms,members,isAdmin}=props;
   const [openAdmin,setOpenAdmin]=useState(null);
-  const [requested,setRequested]=useState({}); // cid -> true (this session)
+  const [requested,setRequested]=useState({});
   const nameOf=(id)=>(members.find(m=>m.id===id)||{}).name||"Member";
   const myIds=myComms.map(c=>c.id);
   const discover=pubComms.filter(c=>myIds.indexOf(c.id)<0);
-
   return(<div>
-    {/* Your communities */}
     <div className="card">
       <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 4px"}}>Your communities</h3>
       {myComms.length===0 && <div className="muted" style={{fontSize:13,marginBottom:6}}>You're not in any community yet. Create one below, or join a public one.</div>}
@@ -780,16 +871,14 @@ function CommunitiesTab(props){
             </span>
           </div>
           {c.description && <div className="muted" style={{fontSize:12,marginTop:4}}>{c.description}</div>}
-          <InviteBox c={c}/>
           {admin && openAdmin===c.id && <AdminPanel c={c} currentUid={currentUid} nameOf={nameOf}
-            onApprove={props.onApprove} onReject={props.onReject} onRemoveMember={props.onRemoveMember} onPromote={props.onPromote}/>}
+            onApprove={props.onApprove} onReject={props.onReject} onRemoveMember={props.onRemoveMember} onPromote={props.onPromote}
+            onSetVisibility={props.onSetVisibility} onRegenInvite={props.onRegenInvite} onRevokeInvite={props.onRevokeInvite}/>}
         </div>);})}
     </div>
 
-    {/* Create */}
     <CreateCommunity canSeed={myComms.length===0} memberCount={members.length} onCreate={props.onCreate}/>
 
-    {/* Discover */}
     <div className="card">
       <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 4px"}}>Discover public communities</h3>
       {discover.length===0 && <div className="muted" style={{fontSize:13}}>No public communities to join right now.</div>}
@@ -803,7 +892,7 @@ function CommunitiesTab(props){
           ? <button className="btn sm" onClick={()=>{props.onCancelRequest(c);setRequested(r=>({...r,[c.id]:false}));}}>Requested — cancel</button>
           : <button className="btn primary sm" onClick={()=>{props.onRequestJoin(c);setRequested(r=>({...r,[c.id]:true}));}}>Request to join</button>}
       </div>))}
-      <div className="muted" style={{fontSize:11,marginTop:8,lineHeight:1.5}}>Secret communities don't appear here — you can only join them through an invite link. Public ones require an admin to approve your request.</div>
+      <div className="muted" style={{fontSize:11,marginTop:8,lineHeight:1.5}}>Secret communities don't appear here — join them only through an invite link. Public ones need an admin to approve your request.</div>
     </div>
   </div>);
 }
@@ -830,25 +919,38 @@ function CreateCommunity(props){
   </div>);
 }
 
-function InviteBox(props){
-  const c=props.c;const [copied,setCopied]=useState(false);const link=inviteLink(c);
-  function copy(){try{navigator.clipboard.writeText(link);setCopied(true);setTimeout(()=>setCopied(false),1500);}catch(e){}}
-  return(<div style={{marginTop:8,background:"var(--parch)",border:"1px solid var(--line)",borderRadius:8,padding:"8px 10px"}}>
-    <div className="muted" style={{fontSize:11,marginBottom:4}}>Invite link · code <b style={{color:"var(--brass)"}}>{c.inviteCode}</b></div>
-    <div style={{display:"flex",gap:8,alignItems:"center"}}>
-      <input className="f" readOnly value={link} style={{fontSize:11,padding:"6px 8px"}} onFocus={e=>e.target.select()}/>
-      <button className="btn sm" onClick={copy}>{copied?"Copied":"Copy"}</button>
-    </div>
-  </div>);
-}
-
 function AdminPanel(props){
-  const c=props.c;const [reqs,setReqs]=useState([]);
+  const c=props.c;const [reqs,setReqs]=useState([]);const [copied,setCopied]=useState(false);
   useEffect(()=>{ if(MODE!=="firebase")return;
     return db.collection("communities").doc(c.id).collection("requests").onSnapshot(s=>setReqs(s.docs.map(d=>d.data())),()=>{});
   },[c.id]);
-  const admins=c.admins||[];const memberIds=c.members||[];
+  const admins=c.admins||[];const memberIds=c.members||[];const active=inviteActive(c);const link=inviteLink(c);
+  function copy(){try{navigator.clipboard.writeText(link);setCopied(true);setTimeout(()=>setCopied(false),1500);}catch(e){}}
   return(<div style={{marginTop:10,background:"var(--parch)",border:"1px solid var(--line)",borderRadius:10,padding:12}}>
+    {/* visibility */}
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,flexWrap:"wrap"}}>
+      <span className="serif" style={{color:"var(--ink)",fontSize:15}}>Visibility</span>
+      <select className="f" style={{maxWidth:320}} value={c.visibility} onChange={e=>props.onSetVisibility(c,e.target.value)}>
+        <option value="secret">Secret — hidden; invite only</option>
+        <option value="public">Public — discoverable; request + approval</option>
+      </select>
+    </div>
+    {/* invite link */}
+    <div style={{marginBottom:12}}>
+      <div className="serif" style={{color:"var(--ink)",fontSize:15,marginBottom:4}}>Invite link</div>
+      {active
+        ? <div>
+            <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4}}>
+              <input className="f" readOnly value={link} style={{fontSize:11,padding:"6px 8px"}} onFocus={e=>e.target.select()}/>
+              <button className="btn sm" onClick={copy}>{copied?"Copied":"Copy"}</button>
+            </div>
+            <div className="muted" style={{fontSize:11}}>Code <b style={{color:"var(--brass)"}}>{c.inviteCode}</b> · expires {new Date(c.inviteExpiresAt).toLocaleDateString()}
+              <button className="link" style={{marginLeft:10}} onClick={()=>props.onRegenInvite(c)}>Regenerate</button>
+              <button className="link" style={{marginLeft:10,color:"var(--danger)"}} onClick={()=>props.onRevokeInvite(c)}>Revoke</button></div>
+          </div>
+        : <div className="muted" style={{fontSize:12}}>No active invite link. <button className="link" onClick={()=>props.onRegenInvite(c)}>Generate one (valid 1 week)</button></div>}
+    </div>
+    {/* requests */}
     <div className="serif" style={{color:"var(--ink)",fontSize:15,marginBottom:6}}>Join requests</div>
     {reqs.length===0 && <div className="muted" style={{fontSize:12,marginBottom:8}}>No pending requests.</div>}
     {reqs.map(r=>(<div key={r.memberId} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}>
@@ -856,6 +958,7 @@ function AdminPanel(props){
       <button className="btn primary sm" onClick={()=>props.onApprove(c.id,r.memberId)}>Approve</button>
       <button className="btn sm" style={{color:"var(--danger)"}} onClick={()=>props.onReject(c.id,r.memberId)}>Reject</button>
     </div>))}
+    {/* members */}
     <div className="serif" style={{color:"var(--ink)",fontSize:15,margin:"12px 0 6px"}}>Members</div>
     {memberIds.map(mid=>(<div key={mid} style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0"}}>
       <span style={{flex:1,fontSize:13}}>{props.nameOf(mid)}{admins.indexOf(mid)>=0 && <span style={{color:"var(--brass)",fontSize:11}}> · admin</span>}{mid===props.currentUid && <span className="muted" style={{fontSize:11}}> · you</span>}</span>
