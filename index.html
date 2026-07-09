@@ -50,7 +50,7 @@
   .cell{flex:1;border-radius:1px;background:var(--parch2);border:1px solid var(--line);overflow:hidden;position:relative}
   .cell>i{position:absolute;left:0;right:0;bottom:0;display:block}
   .bar{flex:1;height:8px;border-radius:4px;background:var(--parch2);border:1px solid var(--line);overflow:hidden;position:relative}
-  .bar>i{display:block;height:100%;position:absolute;left:0;top:0}
+  .bar>i{display:block;height:100%;position:absolute;top:0;border-radius:2px}
   .muted{color:var(--soft)}
   .banner{border-radius:10px;padding:12px 16px;font-size:13px;margin-top:16px;line-height:1.5}
   .banner.warn{background:#FBF3DF;color:#7A5B12;border:1px solid #E6D39B}
@@ -136,6 +136,7 @@ function mergeIntervals(list){if(!list.length)return[];const s=[...list].sort((a
 const countAyahs=(m)=>m.reduce((t,x)=>t+(x[1]-x[0]+1),0);
 function overlapCount(m,from,to){let n=0;for(const x of m)n+=Math.max(0,Math.min(x[1],to)-Math.max(x[0],from)+1);return n;}
 function intersectCount(A,B){let n=0;for(const x of A)n+=overlapCount(B,x[0],x[1]);return n;}
+function intersectRanges(A,B){const out=[];for(const a of A)for(const b of B){const lo=Math.max(a[0],b[0]),hi=Math.min(a[1],b[1]);if(lo<=hi)out.push([lo,hi]);}return mergeIntervals(out);}
 
 const todayStr=()=>new Date().toISOString().slice(0,10);
 function dateNDaysAgo(n){const d=new Date();d.setDate(d.getDate()-n);return d.toISOString().slice(0,10);}
@@ -158,7 +159,7 @@ function computeMember(member,logs,verifs){
   const mergedNew={};for(const s in newBy)mergedNew[s]=mergeIntervals(newBy[s]);
   let memorizedLetters=0;const surahPct={};
   for(let s=1;s<=114;s++){const merged=mergedNew[s]||[];const ay=countAyahs(merged);memorizedLetters+=ay*perAyah(s);
-    surahPct[s]={ayahs:ay,pct:ay/AYAHS[s-1],verified:0};}
+    surahPct[s]={ayahs:ay,pct:ay/AYAHS[s-1],verified:0,ranges:merged,verRanges:[]};}
   const juzFrac=JUZ.map(jz=>{let mem=0;jz.segs.forEach(seg=>{const merged=mergedNew[seg.surah]||[];
     mem+=overlapCount(merged,seg.from,seg.to)*perAyah(seg.surah);});return jz.letters?mem/jz.letters:0;});
   let revisedLetters=0;for(const s in revBy)revBy[s].forEach(x=>{revisedLetters+=(x[1]-x[0]+1)*perAyah(s);});
@@ -169,12 +170,37 @@ function computeMember(member,logs,verifs){
   const verBy={};myVer.forEach(v=>{(verBy[v.surah]=verBy[v.surah]||[]).push([v.from,v.to]);});
   let verifiedLetters=0;
   for(const s in verBy){const mergedV=mergeIntervals(verBy[s]);const cnt=intersectCount(mergedV,mergedNew[s]||[]);
-    verifiedLetters+=cnt*perAyah(s);if(surahPct[s])surahPct[s].verified=cnt;}
+    verifiedLetters+=cnt*perAyah(s);if(surahPct[s]){surahPct[s].verified=cnt;surahPct[s].verRanges=intersectRanges(mergedV,mergedNew[s]||[]);}}
   return{...member,memorizedLetters,pct:Math.min(100,(memorizedLetters/TOTAL_LETTERS)*100),surahPct,juzFrac,
     juzDone:juzFrac.filter(f=>f>=0.999).length,juzEquiv:juzFrac.reduce((a,b)=>a+b,0),
     revisedLetters,revSessions:mine.filter(l=>l.type==="rev").length,streak:currentStreak(dates),
     activeDays:new Set(dates).size,new7,new30,verifiedLetters,verifiedPct:(verifiedLetters/TOTAL_LETTERS)*100,
     verifs:myVer,lastActive:dates.length?dates.reduce((a,b)=>a>b?a:b):null,lastRevised};
+}
+
+function timeAgo(ms){
+  const d=Date.now()-ms;
+  if(d<60000)return "just now";
+  const m=Math.floor(d/60000); if(m<60)return m+"m ago";
+  const h=Math.floor(m/60); if(h<24)return h+"h ago";
+  const dy=Math.floor(h/24); if(dy<7)return dy+"d ago";
+  const w=Math.floor(dy/7); if(dy<14)return w+"w ago";
+  return new Date(ms).toLocaleDateString(undefined,{month:"short",day:"numeric"});
+}
+function segStyles(ranges,total){
+  if(!ranges||!ranges.length||!total)return [];
+  const MINW=1.2; // % — keeps a single ayah in a long surah visible
+  return ranges.map(r=>{
+    const left=((r[0]-1)/total)*100;
+    let w=((r[1]-r[0]+1)/total)*100;
+    if(w<MINW)w=MINW;
+    const l=Math.min(left,100-w);
+    return {left:Math.max(0,l)+"%",width:w+"%"};
+  });
+}
+function rangesLabel(ranges){
+  if(!ranges||!ranges.length)return "—";
+  return ranges.map(r=>r[0]===r[1]?String(r[0]):r[0]+"–"+r[1]).join(", ");
 }
 
 function Star(props){const size=props.size||24,fill=props.fill||"#B5872E",stroke=props.stroke||"none";
@@ -320,6 +346,7 @@ function App(props){
   const [invite,setInvite]=useState(null);
   const [inviteBad,setInviteBad]=useState(false);
   const [bellOpen,setBellOpen]=useState(false);
+  const [bellSeenAt,setBellSeenAt]=useState(null);
   const fileRef=useRef(null);
   function chooseCid(cid){setSelectedCid(cid);if(cid)localStorage.setItem("halaqa_cid",cid);else localStorage.removeItem("halaqa_cid");}
 
@@ -369,9 +396,14 @@ function App(props){
 
   const myCommIds=myComms.map(c=>c.id);
   const prefKey={new:"newMem",juz:"juz",surah:"milestone",full:"milestone",join:"join"};
+  const NOTIF_MAX_AGE=14*24*60*60*1000, NOTIF_MAX=15;
+  const cutoff=Date.now()-NOTIF_MAX_AGE;
   const myEvents=events.filter(e=>e.actorId!==currentUid
       && (e.communityIds||[]).some(id=>myCommIds.indexOf(id)>=0)
-      && prefs[prefKey[e.type]]!==false);
+      && prefs[prefKey[e.type]]!==false
+      && e.createdAt>=cutoff)
+    .sort((a,b)=>b.createdAt-a.createdAt)
+    .slice(0,NOTIF_MAX);
   const unread=myEvents.filter(e=>e.createdAt>seenAt).length;
 
   async function emitEvent(type,text,cids){
@@ -486,8 +518,11 @@ function App(props){
         <div><h1 className="brand">Halaqa</h1><div className="sub">{selectedCommunity?selectedCommunity.name:"Hifz progress, weighted by length"}</div></div>
       </div>
       <div style={{display:"flex",alignItems:"center",gap:14}}>
-        <Bell events={myEvents} unread={unread} open={bellOpen}
-          onToggle={()=>{const nx=!bellOpen;setBellOpen(nx);if(nx)markNotifSeen();}}/>
+        <Bell events={myEvents} unread={unread} open={bellOpen} splitAt={bellSeenAt!==null?bellSeenAt:seenAt}
+          onMarkRead={()=>{setBellSeenAt(Date.now());markNotifSeen();}}
+          onToggle={()=>{const nx=!bellOpen;
+            if(nx){setBellSeenAt(seenAt);markNotifSeen();}else{setBellSeenAt(null);}
+            setBellOpen(nx);}}/>
         <div style={{textAlign:"right"}}><div className="big tnum">{groupPct.toFixed(1)}%</div><div className="sub">{selectedCommunity?"community avg":"—"}</div></div>
       </div>
     </header>
@@ -637,17 +672,17 @@ function MemberDetail(props){
     <VerificationCard s={s} isSelf={isSelf} onAdd={props.onAddVerif} onRemove={props.onRemoveVerif}/>
 
     <div className="card">
-      <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 12px"}}>By surah <span className="muted" style={{fontSize:12,fontWeight:400}}>(green memorized · ✓ = verified ayahs)</span></h3>
+      <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 12px"}}>By surah <span className="muted" style={{fontSize:12,fontWeight:400}}>(green shows which ayahs · brass = verified)</span></h3>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:"8px 24px"}}>
-        {NAMES.map((nm,idx)=>{const s1=idx+1;const p=s.surahPct[s1];const done=p.pct>=0.999;const verPct=p.ayahs?p.verified/AYAHS[idx]:0;
+        {NAMES.map((nm,idx)=>{const s1=idx+1;const p=s.surahPct[s1];const done=p.pct>=0.999;const total=AYAHS[idx];
           return(<div key={s1} className="surahrow">
             <span className="muted tnum" style={{width:22,textAlign:"right",fontSize:11,flexShrink:0}}>{s1}</span>
             <span style={{width:104,fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flexShrink:0,color:p.ayahs?"var(--text)":"var(--soft)"}}>{nm}</span>
-            <div className="bar">
-              <i style={{width:Math.round(p.pct*100)+"%",background:done?"var(--em)":"var(--em2)"}}/>
-              <i style={{width:Math.round(verPct*100)+"%",background:"var(--brass)",opacity:.8}}/>
+            <div className="bar" title={p.ayahs?nm+" — memorized ayahs "+rangesLabel(p.ranges)+(p.verified?" · verified "+rangesLabel(p.verRanges):""):nm+" — not started"}>
+              {segStyles(p.ranges,total).map((st,i)=><i key={"m"+i} style={{left:st.left,width:st.width,background:done?"var(--em)":"var(--em2)"}}/>)}
+              {segStyles(p.verRanges,total).map((st,i)=><i key={"v"+i} style={{left:st.left,width:st.width,background:"var(--brass)",opacity:.85}}/>)}
             </div>
-            <span className="muted tnum" style={{width:52,textAlign:"right",fontSize:10,flexShrink:0}}>{p.ayahs}/{AYAHS[idx]}{p.verified>0?" ✓":""}</span>
+            <span className="muted tnum" style={{width:52,textAlign:"right",fontSize:10,flexShrink:0}}>{p.ayahs}/{total}{p.verified>0?" ✓":""}</span>
           </div>);})}
       </div>
     </div>
@@ -822,8 +857,26 @@ function Activity(props){
     </div>);})}</div>);
 }
 
+function NotifRow(props){
+  const e=props.e;
+  return(<div style={{padding:"8px",borderTop:"1px solid var(--line)",fontSize:13,
+    background:props.isNew?"rgba(28,107,82,0.05)":"transparent"}}>
+    <div style={{display:"flex",gap:6}}>
+      <span style={{flex:1,minWidth:0}}>
+        <b className="serif" style={{color:"var(--ink)"}}>{e.actorName}</b> {e.text}
+      </span>
+      {props.isNew && <span style={{width:6,height:6,borderRadius:3,background:"var(--em)",flexShrink:0,marginTop:5}}/>}
+    </div>
+    <div className="muted" style={{fontSize:11,marginTop:3,textAlign:"right"}}>{timeAgo(e.createdAt)}</div>
+  </div>);
+}
+
 function Bell(props){
-  const {events,unread,open}=props;
+  const {events,unread,open,splitAt}=props;
+  const fresh=events.filter(e=>e.createdAt>splitAt);
+  const earlier=events.filter(e=>e.createdAt<=splitAt);
+  const Hdr=(t)=>(<div className="muted" style={{fontSize:10,letterSpacing:".06em",textTransform:"uppercase",
+    padding:"8px 8px 2px",fontWeight:600}}>{t}</div>);
   return(<div style={{position:"relative"}}>
     <button onClick={props.onToggle} title="Notifications" style={{background:"none",border:"none",cursor:"pointer",position:"relative",padding:4}}>
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--ink)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
@@ -831,14 +884,19 @@ function Bell(props){
       {unread>0 && <span style={{position:"absolute",top:0,right:0,background:"var(--danger)",color:"#fff",fontSize:10,
         minWidth:16,height:16,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px"}}>{unread>9?"9+":unread}</span>}
     </button>
-    {open && <div style={{position:"absolute",right:0,top:34,width:300,maxHeight:360,overflowY:"auto",zIndex:20,
+    {open && <div style={{position:"absolute",right:0,top:34,width:310,maxHeight:400,overflowY:"auto",zIndex:20,
       background:"var(--card)",border:"1px solid var(--line)",borderRadius:12,boxShadow:"0 6px 24px rgba(0,0,0,.12)",padding:8}}>
-      <div className="serif" style={{color:"var(--ink)",fontSize:15,padding:"4px 8px 8px"}}>Notifications</div>
+      <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",padding:"4px 8px 6px"}}>
+        <span className="serif" style={{color:"var(--ink)",fontSize:15}}>Notifications</span>
+        {fresh.length>0 && <button className="link" style={{fontSize:11}} onClick={props.onMarkRead}>Mark all as read</button>}
+      </div>
       {events.length===0 && <div className="muted" style={{fontSize:13,padding:"8px"}}>Nothing yet. Activity from your communities appears here.</div>}
-      {events.slice(0,40).map(e=>(<div key={e.id} style={{padding:"8px",borderTop:"1px solid var(--line)",fontSize:13}}>
-        <b className="serif" style={{color:"var(--ink)"}}>{e.actorName}</b> {e.text}
-        <div className="muted" style={{fontSize:11,marginTop:2}}>{prettyDate((new Date(e.createdAt)).toISOString().slice(0,10))}</div>
-      </div>))}
+      {fresh.length>0 && Hdr("New")}
+      {fresh.map(e=><NotifRow key={e.id} e={e} isNew={true}/>)}
+      {earlier.length>0 && Hdr("Earlier")}
+      {earlier.map(e=><NotifRow key={e.id} e={e} isNew={false}/>)}
+      {events.length>0 && <div className="muted" style={{fontSize:10,padding:"8px 8px 2px",textAlign:"center",borderTop:"1px solid var(--line)",marginTop:4}}>
+        Showing the latest {events.length}. Notifications older than 14 days are cleared.</div>}
     </div>}
   </div>);
 }
