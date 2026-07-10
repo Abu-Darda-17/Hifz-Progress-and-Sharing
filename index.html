@@ -247,6 +247,72 @@ const BOARDS={
 };
 
 /* ══════════════════════════ ROOT: gate → auth → app ══════════════════════════ */
+/* ── Username support ─────────────────────────────────────────────────────────
+   Firebase Auth only knows emails. For username accounts we mint an internal
+   address (username@USERNAME_DOMAIN) and keep a public usernames/{lower} doc
+   mapping the username to that address so people can sign in by username.
+   Username-only accounts have NO password recovery — the user is warned.        */
+const USERNAME_DOMAIN="halaqa.local";
+const isEmail=(s)=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
+const userRe=/^[a-zA-Z0-9._-]{3,20}$/;
+function usernameError(u){
+  u=(u||"").trim();
+  if(!u)return "Please choose a username.";
+  if(!userRe.test(u))return "3–20 characters: letters, numbers, dot, underscore or hyphen.";
+  return "";
+}
+async function usernameTaken(u){
+  const d=await db.collection("usernames").doc(u.trim().toLowerCase()).get();
+  return d.exists;
+}
+async function emailForUsername(u){
+  const d=await db.collection("usernames").doc(u.trim().toLowerCase()).get();
+  return d.exists?(d.data().email||null):null;
+}
+
+/* Google sign-in. Works for new users, returning users, and (via linking) guests. */
+async function signInWithGoogle(){
+  const provider=new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({prompt:"select_account"});
+  const cur=auth.currentUser;
+  let cred;
+  if(cur && cur.isAnonymous){
+    // Guest upgrading: keep the same uid so all logged progress is preserved.
+    try{
+      cred=await cur.linkWithPopup(provider);
+    }catch(e){
+      if(e.code==="auth/credential-already-in-use")
+        throw new Error("That Google account already has a Halaqa account. Sign out of guest mode and sign in with Google instead. (Progress logged as a guest can't be merged into an existing account.)");
+      throw e;
+    }
+  }else{
+    cred=await auth.signInWithPopup(provider);
+  }
+  const u=cred.user;
+  // create the member profile the first time
+  const ref=db.collection("members").doc(u.uid);
+  const snap=await ref.get();
+  if(!snap.exists || !(snap.data()||{}).name){
+    await ref.set({id:u.uid,name:(u.displayName||"Member").trim(),email:u.email||null,guest:false,createdAt:Date.now()},{merge:true});
+  }else{
+    await ref.set({email:u.email||null,guest:false},{merge:true});
+  }
+  return u;
+}
+
+function GoogleButton(props){
+  return(<button className="btn" style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:10}}
+    disabled={props.busy} onClick={props.onClick}>
+    <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h11.8c-.5 2.7-2 5-4.3 6.6v5.5h7c4.1-3.8 6.6-9.4 6.6-16.1z"/>
+      <path fill="#34A853" d="M24 46c5.8 0 10.7-1.9 14.3-5.2l-7-5.5c-1.9 1.3-4.4 2.1-7.3 2.1-5.6 0-10.4-3.8-12.1-8.9H4.7v5.6C8.3 41.4 15.6 46 24 46z"/>
+      <path fill="#FBBC05" d="M11.9 28.5c-.4-1.3-.7-2.6-.7-4s.3-2.7.7-4v-5.6H4.7C3.2 17.8 2.4 20.8 2.4 24s.8 6.2 2.3 9.1l7.2-4.6z"/>
+      <path fill="#EA4335" d="M24 10.6c3.2 0 6 1.1 8.2 3.2l6.2-6.2C34.7 4.1 29.8 2 24 2 15.6 2 8.3 6.6 4.7 14.9l7.2 5.6c1.7-5.1 6.5-8.9 12.1-8.9z"/>
+    </svg>
+    <span>{props.label||"Continue with Google"}</span>
+  </button>);
+}
+
 function Root(){
   const [gated,setGated]=useState(!APP_PASSPHRASE || 
 localStorage.getItem("halaqa_gate")==="ok");
@@ -260,7 +326,7 @@ localStorage.getItem("halaqa_gate")==="ok");
   if(MODE==="firebase"){
     if(user===undefined) return <Loading/>;
     if(!user) return <AuthScreen/>;
-    return <App currentUid={user.uid} currentEmail={user.email}/>;
+    return <App currentUid={user.uid} currentEmail={user.email} isGuest={!!user.isAnonymous}/>;
   }
   // local test mode
   if(!localMe) return <LocalNameScreen onSet={(name)=>{const me={id:uid(),name:name.trim()};lsSet(LKEY.me,me);
@@ -328,42 +394,162 @@ function LocalNameScreen(props){
 
 function AuthScreen(){
   const [mode,setMode]=useState("in");
-  const [email,setEmail]=useState("");const [pw,setPw]=useState("");const [name,setName]=useState("");
+  const [id,setId]=useState("");          // sign-in: username OR email
+  const [useEmail,setUseEmail]=useState(true); // sign-up method
+  const [email,setEmail]=useState("");
+  const [uname,setUname]=useState("");
+  const [pw,setPw]=useState("");
+  const [name,setName]=useState("");
+  const [ack,setAck]=useState(false);     // acknowledged no-recovery warning
   const [err,setErr]=useState("");const [busy,setBusy]=useState(false);
+  const [info,setInfo]=useState("");
+
   async function submit(){
-    setErr("");setBusy(true);
+    setErr("");setInfo("");setBusy(true);
     try{
       if(mode==="up"){
         if(!name.trim())throw new Error("Please enter your name.");
-        const cred=await auth.createUserWithEmailAndPassword(email.trim(),pw);
-        await db.collection("members").doc(cred.user.uid).set({id:cred.user.uid,name:name.trim(),email:email.trim(),createdAt:Date.now()});
+        if(!pw || pw.length<6)throw new Error("Password must be at least 6 characters.");
+        if(useEmail){
+          if(!isEmail(email))throw new Error("Please enter a valid email address.");
+          const cred=await auth.createUserWithEmailAndPassword(email.trim(),pw);
+          await db.collection("members").doc(cred.user.uid).set({id:cred.user.uid,name:name.trim(),email:email.trim(),createdAt:Date.now()});
+        }else{
+          const ue=usernameError(uname); if(ue)throw new Error(ue);
+          if(!ack)throw new Error("Please tick the box to confirm you understand the password cannot be recovered.");
+          const key=uname.trim().toLowerCase();
+          if(await usernameTaken(key))throw new Error("That username is already taken.");
+          const internal=key+"@"+USERNAME_DOMAIN;
+          const cred=await auth.createUserWithEmailAndPassword(internal,pw);
+          await db.collection("usernames").doc(key).set({username:key,email:internal,uid:cred.user.uid,createdAt:Date.now()});
+          await db.collection("members").doc(cred.user.uid).set({id:cred.user.uid,name:name.trim(),username:key,email:null,createdAt:Date.now()});
+        }
       }else{
-        await auth.signInWithEmailAndPassword(email.trim(),pw);
+        const raw=id.trim(); if(!raw)throw new Error("Enter your username or email.");
+        let addr=raw;
+        if(!isEmail(raw)){
+          addr=await emailForUsername(raw);
+          if(!addr)throw new Error("No account found with that username.");
+        }
+        await auth.signInWithEmailAndPassword(addr,pw);
       }
-    }catch(e){setErr(e.message||String(e));}
+    }catch(e){setErr(friendlyAuthError(e));}
     setBusy(false);
   }
+
+  async function guest(){
+    setErr("");setBusy(true);
+    try{ await auth.signInAnonymously(); }
+    catch(e){ setErr(friendlyAuthError(e)); }
+    setBusy(false);
+  }
+
+  async function google(){
+    setErr("");setInfo("");setBusy(true);
+    try{ await signInWithGoogle(); }
+    catch(e){ setErr(friendlyAuthError(e)); }
+    setBusy(false);
+  }
+
+  async function resetPw(){
+    setErr("");setInfo("");
+    const raw=id.trim();
+    if(!raw)return setErr("Enter your email above first.");
+    let addr=raw;
+    try{
+      if(!isEmail(raw)){ addr=await emailForUsername(raw); }
+      if(!addr)return setErr("No account found.");
+      if(addr.endsWith("@"+USERNAME_DOMAIN))
+        return setErr("This is a username-only account, so there is no email to send a reset to. Its password cannot be recovered.");
+      await auth.sendPasswordResetEmail(addr);
+      setInfo("Password reset email sent. Check your inbox.");
+    }catch(e){setErr(friendlyAuthError(e));}
+  }
+
   return(<div className="center"><div className="card authcard">
     <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}><Star size={30} fill="var(--em)"/>
       <h1 className="brand" style={{fontSize:24}}>Halaqa</h1></div>
     <div className="row" style={{marginBottom:16,gap:6}}>
-      <button className={"pill"+(mode==="in"?" active":"")} onClick={()=>setMode("in")}>Sign in</button>
-      <button className={"pill"+(mode==="up"?" active":"")} onClick={()=>setMode("up")}>Create account</button>
+      <button className={"pill"+(mode==="in"?" active":"")} onClick={()=>{setMode("in");setErr("");setInfo("");}}>Sign in</button>
+      <button className={"pill"+(mode==="up"?" active":"")} onClick={()=>{setMode("up");setErr("");setInfo("");}}>Create account</button>
     </div>
-    {mode==="up" && <><label className="lb">Your name (shown on the board)</label>
-      <input className="f" style={{marginBottom:12}} value={name} onChange={e=>setName(e.target.value)}/></>}
-    <label className="lb">Email</label>
-    <input className="f" style={{marginBottom:12}} type="email" value={email} onChange={e=>setEmail(e.target.value)}/>
-    <label className="lb">Password</label>
-    <input className="f" type="password" value={pw} onChange={e=>setPw(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/>
+
+    <GoogleButton busy={busy} onClick={google} label={mode==="up"?"Sign up with Google":"Continue with Google"}/>
+    <div className="muted" style={{fontSize:11,marginTop:8,textAlign:"center"}}>Fastest and safest — no password to remember.</div>
+    <div style={{display:"flex",alignItems:"center",gap:10,margin:"14px 0"}}>
+      <span style={{height:1,flex:1,background:"var(--line)"}}/><span className="muted" style={{fontSize:11}}>or</span><span style={{height:1,flex:1,background:"var(--line)"}}/>
+    </div>
+
+    {mode==="in" ? (<React.Fragment>
+      <label className="lb">Username or email</label>
+      <input className="f" style={{marginBottom:12}} value={id} autoCapitalize="none" onChange={e=>setId(e.target.value)}/>
+      <label className="lb">Password</label>
+      <input className="f" type="password" value={pw} onChange={e=>setPw(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/>
+      <div style={{textAlign:"right",marginTop:6}}><button className="link" style={{fontSize:11}} onClick={resetPw}>Forgot password?</button></div>
+    </React.Fragment>) : (<React.Fragment>
+      <label className="lb">Your name (shown on the board)</label>
+      <input className="f" style={{marginBottom:12}} value={name} onChange={e=>setName(e.target.value)}/>
+
+      <label className="lb">Sign up with</label>
+      <div className="row" style={{marginBottom:12,gap:6}}>
+        <button className={"pill"+(useEmail?" active":"")} style={{fontSize:13}} onClick={()=>{setUseEmail(true);setErr("");}}>Email</button>
+        <button className={"pill"+(!useEmail?" active":"")} style={{fontSize:13}} onClick={()=>{setUseEmail(false);setErr("");}}>Username only</button>
+      </div>
+
+      {useEmail ? (<React.Fragment>
+        <label className="lb">Email</label>
+        <input className="f" style={{marginBottom:12}} type="email" value={email} autoCapitalize="none" onChange={e=>setEmail(e.target.value)}/>
+        <div className="muted" style={{fontSize:11,marginBottom:12}}>Used only so you can recover your password. Never shown on the board.</div>
+      </React.Fragment>) : (<React.Fragment>
+        <label className="lb">Username</label>
+        <input className="f" style={{marginBottom:8}} value={uname} autoCapitalize="none" placeholder="e.g. abu_darda" onChange={e=>setUname(e.target.value)}/>
+        <div style={{background:"#FBF3DF",border:"1px solid #E6D39B",color:"#7A5B12",borderRadius:8,padding:"10px 12px",fontSize:12,lineHeight:1.5,marginBottom:10}}>
+          <b>Please read.</b> With no email, there is <b>no way to recover your password</b> if you forget it — your account and all your progress would be lost permanently. We strongly recommend signing up with an email instead.
+          <label style={{display:"flex",alignItems:"flex-start",gap:8,marginTop:8}}>
+            <input type="checkbox" checked={ack} onChange={e=>setAck(e.target.checked)} style={{marginTop:3}}/>
+            <span>I understand my password cannot be recovered.</span>
+          </label>
+        </div>
+      </React.Fragment>)}
+
+      <label className="lb">Password</label>
+      <input className="f" type="password" value={pw} onChange={e=>setPw(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/>
+    </React.Fragment>)}
+
     {err && <div style={{color:"var(--danger)",fontSize:12,marginTop:10}}>{err}</div>}
+    {info && <div style={{color:"var(--em)",fontSize:12,marginTop:10}}>{info}</div>}
+
     <button className="btn primary" style={{marginTop:16,width:"100%"}} disabled={busy} onClick={submit}>
       {busy?"…":(mode==="up"?"Create account":"Sign in")}</button>
-    <div className="muted" style={{fontSize:11,marginTop:12,lineHeight:1.5}}>Your account protects your data: only you can add or change your own entries.</div>
+
+    <div style={{display:"flex",alignItems:"center",gap:10,margin:"16px 0 12px"}}>
+      <span style={{height:1,flex:1,background:"var(--line)"}}/><span className="muted" style={{fontSize:11}}>or</span><span style={{height:1,flex:1,background:"var(--line)"}}/>
+    </div>
+    <button className="btn" style={{width:"100%"}} disabled={busy} onClick={guest}>Continue as guest</button>
+    <div className="muted" style={{fontSize:11,marginTop:10,lineHeight:1.5}}>
+      As a guest you can track your own Hifz privately on this device. To join a community you'll need an account — you can create one later and keep your progress.
+    </div>
   </div></div>);
 }
 
-/* ══════════════════════════════════ APP ═════════════════════════════════════ */
+function friendlyAuthError(e){
+  const c=(e&&e.code)||"";
+  if(c==="auth/email-already-in-use")return "An account already exists with that email.";
+  if(c==="auth/account-exists-with-different-credential")return "You already have an account with that email, created a different way. Sign in with that method instead.";
+  if(c==="auth/popup-closed-by-user"||c==="auth/cancelled-popup-request")return "Google sign-in was closed before finishing.";
+  if(c==="auth/popup-blocked")return "Your browser blocked the Google pop-up. Allow pop-ups for this site and try again.";
+  if(c==="auth/unauthorized-domain")return "This website address isn't authorised for Google sign-in yet. Add it in Firebase → Authentication → Settings → Authorized domains.";
+  if(c==="auth/credential-already-in-use")return "That Google account is already linked to another Halaqa account.";
+  if(c==="auth/invalid-email")return "That email address doesn't look right.";
+  if(c==="auth/weak-password")return "Password must be at least 6 characters.";
+  if(c==="auth/wrong-password"||c==="auth/invalid-credential")return "Wrong password, or that account doesn't exist.";
+  if(c==="auth/user-not-found")return "No account found.";
+  if(c==="auth/too-many-requests")return "Too many attempts. Please wait a little and try again.";
+  if(c==="auth/operation-not-allowed")return "This sign-in method isn't enabled yet in Firebase (see the setup guide).";
+  if(c==="auth/admin-restricted-operation")return "Guest sign-in isn't enabled yet in Firebase (enable Anonymous sign-in).";
+  return (e&&e.message)||String(e);
+}
+
 function App(props){
   const currentUid=props.currentUid;
   const [members,setMembers]=useState([]);
@@ -469,10 +655,34 @@ function App(props){
     if(MODE==="firebase")await db.collection("verifications").doc(id).delete();
     else{const n=verifs.filter(v=>v.id!==id);setVerifs(n);lsSet(LKEY.verifs,n);}}
   async function saveName(name){
-    if(MODE==="firebase")await db.collection("members").doc(currentUid).set({id:currentUid,name:name.trim(),email:props.currentEmail||null,createdAt:Date.now()},{merge:true});
+    if(MODE==="firebase"){
+      const doc={id:currentUid,name:name.trim(),createdAt:Date.now()};
+      if(props.currentEmail && !String(props.currentEmail).endsWith("@"+USERNAME_DOMAIN))doc.email=props.currentEmail;
+      if(props.isGuest)doc.guest=true;
+      await db.collection("members").doc(currentUid).set(doc,{merge:true});
+    }
     else{const ms=lsGet(LKEY.members).map(m=>m.id===currentUid?{...m,name:name.trim()}:m);setMembers(ms);lsSet(LKEY.members,ms);
       lsSet(LKEY.me,{id:currentUid,name:name.trim()});}}
   function signOut(){ if(MODE==="firebase")auth.signOut(); else {localStorage.removeItem(LKEY.me);location.reload();} }
+
+  // Guest -> real account. Links the credential so the SAME uid (and all logs) is kept.
+  async function upgradeGuest(kind,identifier,pw,displayName){
+    if(kind==="email"){
+      if(!isEmail(identifier))throw new Error("Please enter a valid email address.");
+      const cred=firebase.auth.EmailAuthProvider.credential(identifier.trim(),pw);
+      await auth.currentUser.linkWithCredential(cred);
+      await db.collection("members").doc(currentUid).set({id:currentUid,name:(displayName||myName).trim(),email:identifier.trim(),guest:false},{merge:true});
+    }else{
+      const ue=usernameError(identifier); if(ue)throw new Error(ue);
+      const key=identifier.trim().toLowerCase();
+      if(await usernameTaken(key))throw new Error("That username is already taken.");
+      const internal=key+"@"+USERNAME_DOMAIN;
+      const cred=firebase.auth.EmailAuthProvider.credential(internal,pw);
+      await auth.currentUser.linkWithCredential(cred);
+      await db.collection("usernames").doc(key).set({username:key,email:internal,uid:currentUid,createdAt:Date.now()});
+      await db.collection("members").doc(currentUid).set({id:currentUid,name:(displayName||myName).trim(),username:key,email:null,guest:false},{merge:true});
+    }
+  }
 
   const FV=(MODE==="firebase")?firebase.firestore.FieldValue:null;
   const WEEK=7*24*60*60*1000;
@@ -542,7 +752,8 @@ function App(props){
     return <SetNameScreen onSet={saveName}/>;
 
   const focus=focusMember?stats.find(s=>s.id===focusMember):null;
-  const account={onSaveName:saveName,onSignOut:signOut,onExport:exportData,onImport:()=>fileRef.current.click(),email:props.currentEmail,prefs:prefs,onSavePrefs:saveNotifPrefs};
+  const isGuest=!!props.isGuest;
+  const account={onSaveName:saveName,onSignOut:signOut,onExport:exportData,onImport:()=>fileRef.current.click(),email:props.currentEmail,prefs:prefs,onSavePrefs:saveNotifPrefs,isGuest:isGuest,onUpgrade:upgradeGuest};
   const alreadyMember=invite && (invite.members||[]).indexOf(currentUid)>=0;
 
   return(<div className="wrap">
@@ -562,10 +773,17 @@ function App(props){
     </header>
 
     {MODE==="local" && <div className="banner warn">Local test mode — data stays in this browser only. Add Firebase for real accounts and sharing.</div>}
+    {isGuest && <div className="banner warn">
+      You're using Halaqa as a <b>guest</b>. Your progress is saved only on this device — clear your browser or switch phones and it's gone.
+      <button className="link" style={{marginLeft:8,color:"#7A5B12",fontWeight:600}} onClick={()=>{setFocusMember(null);setTab("me");}}>Create an account to keep it →</button>
+    </div>}
 
-    {invite && !alreadyMember && <div className="banner" style={{background:"#EAF3EE",border:"1px solid #BEDBCB",color:"var(--ink)"}}>
+    {invite && !alreadyMember && (isGuest
+      ? <div className="banner warn">You've been invited to <b>{invite.name}</b>. Create an account to join — your progress will be kept.
+          <button className="link" style={{marginLeft:8,color:"#7A5B12",fontWeight:600}} onClick={()=>setTab("me")}>Create account →</button></div>
+      : <div className="banner" style={{background:"#EAF3EE",border:"1px solid #BEDBCB",color:"var(--ink)"}}>
       You've been invited to <b>{invite.name}</b>. <button className="btn primary sm" style={{marginLeft:8}} onClick={()=>joinByInvite(invite)}>Join</button>
-      <button className="link" style={{marginLeft:10}} onClick={()=>setInvite(null)}>Dismiss</button></div>}
+      <button className="link" style={{marginLeft:10}} onClick={()=>setInvite(null)}>Dismiss</button></div>)}
     {invite && alreadyMember && <div className="banner warn">You're already in {invite.name}. <button className="link" style={{marginLeft:8}} onClick={()=>{chooseCid(invite.id);setInvite(null);setTab("standings");}}>Open it</button></div>}
     {inviteBad && <div className="banner warn">That invite link has expired or is invalid. Ask an admin for a fresh one. <button className="link" style={{marginLeft:8}} onClick={()=>setInviteBad(false)}>Dismiss</button></div>}
 
@@ -583,12 +801,14 @@ function App(props){
             myComms={myComms} onSelect={chooseCid} onGoCommunities={()=>setTab("communities")} onOpen={setFocusMember}/>}
         {tab==="log" && <LogForm me={me} onAdd={addLog} onAddVerif={addVerif} goStandings={()=>setTab("standings")}/>}
         {tab==="activity" && <Activity logs={logs.filter(l=>commMemberIds.indexOf(l.memberId)>=0)} members={members} currentUid={currentUid} onRemove={removeLog}/>}
-        {tab==="communities" && <CommunitiesTab currentUid={currentUid} myName={myName} members={members}
+        {tab==="communities" && (isGuest
+          ? <GuestBlock onGo={()=>setTab("me")}/>
+          : <CommunitiesTab currentUid={currentUid} myName={myName} members={members}
             myComms={myComms} pubComms={pubComms} selectedCid={selectedCommunity?selectedCommunity.id:null} isAdmin={isAdmin}
             onSelect={(cid)=>{chooseCid(cid);setTab("standings");}} onCreate={createCommunity} onRequestJoin={requestJoin}
             onCancelRequest={cancelRequest} onLeave={leaveCommunity} onApprove={approveReq} onReject={rejectReq}
             onRemoveMember={removeMemberFromComm} onPromote={promoteAdmin} onSetVisibility={setVisibility}
-            onRegenInvite={regenInvite} onRevokeInvite={revokeInvite}/>}
+            onRegenInvite={regenInvite} onRevokeInvite={revokeInvite}/>)}
         {tab==="me" && (me
           ? <MemberDetail s={me} isSelf={true} champions={cChampions} account={account}
               onRemoveLog={removeLog} onAddVerif={addVerif} onRemoveVerif={removeVerif}/>
@@ -701,6 +921,7 @@ function MemberDetail(props){
       </div>
     </div>
 
+    {acc && acc.isGuest && <UpgradeCard onUpgrade={acc.onUpgrade}/>}
     {acc && <AccountCard s={s} acc={acc}/>}
 
     <VerificationCard s={s} isSelf={isSelf} onAdd={props.onAddVerif} onRemove={props.onRemoveVerif}/>
@@ -724,6 +945,75 @@ function MemberDetail(props){
 }
 
 
+function GuestBlock(props){
+  return(<div className="card dash" style={{textAlign:"center",padding:32}}>
+    <div style={{opacity:.4,display:"flex",justifyContent:"center",marginBottom:12}}><Star size={28}/></div>
+    <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:0}}>Communities need an account</h3>
+    <div className="muted" style={{fontSize:14,marginTop:6,maxWidth:380,marginLeft:"auto",marginRight:"auto",lineHeight:1.6}}>
+      Guests can track their own Hifz privately. To create or join a community — and to keep your progress safely — create an account. Everything you've logged so far will carry over.
+    </div>
+    <button className="btn primary" style={{marginTop:16}} onClick={props.onGo}>Create an account</button>
+  </div>);
+}
+
+function UpgradeCard(props){
+  const [useEmail,setUseEmail]=useState(true);
+  const [email,setEmail]=useState("");const [uname,setUname]=useState("");
+  const [pw,setPw]=useState("");const [ack,setAck]=useState(false);
+  const [err,setErr]=useState("");const [busy,setBusy]=useState(false);
+  async function go(){
+    setErr("");
+    if(!pw||pw.length<6)return setErr("Password must be at least 6 characters.");
+    if(!useEmail && !ack)return setErr("Please tick the box to confirm you understand the password cannot be recovered.");
+    setBusy(true);
+    try{ await props.onUpgrade(useEmail?"email":"username", useEmail?email:uname, pw); }
+    catch(e){ setErr(friendlyAuthError(e)); }
+    setBusy(false);
+  }
+  async function google(){
+    setErr("");setBusy(true);
+    try{ await signInWithGoogle(); }
+    catch(e){ setErr(friendlyAuthError(e)); }
+    setBusy(false);
+  }
+  return(<div className="card" style={{border:"1px solid var(--brass2)"}}>
+    <h3 className="serif" style={{color:"var(--ink)",fontSize:18,margin:"0 0 4px"}}>Create your account</h3>
+    <div className="muted" style={{fontSize:12,lineHeight:1.5,marginBottom:12}}>
+      You're a guest. Create an account to keep your progress safely, use it on other devices, and join communities. <b>Everything you've already logged is kept.</b>
+    </div>
+    <GoogleButton busy={busy} onClick={google} label="Continue with Google"/>
+    <div style={{display:"flex",alignItems:"center",gap:10,margin:"14px 0"}}>
+      <span style={{height:1,flex:1,background:"var(--line)"}}/><span className="muted" style={{fontSize:11}}>or</span><span style={{height:1,flex:1,background:"var(--line)"}}/>
+    </div>
+    <label className="lb">Sign up with</label>
+    <div className="row" style={{marginBottom:12,gap:6}}>
+      <button className={"pill"+(useEmail?" active":"")} style={{fontSize:13}} onClick={()=>{setUseEmail(true);setErr("");}}>Email</button>
+      <button className={"pill"+(!useEmail?" active":"")} style={{fontSize:13}} onClick={()=>{setUseEmail(false);setErr("");}}>Username only</button>
+    </div>
+    {useEmail
+      ? <React.Fragment>
+          <label className="lb">Email</label>
+          <input className="f" style={{marginBottom:6}} type="email" autoCapitalize="none" value={email} onChange={e=>setEmail(e.target.value)}/>
+          <div className="muted" style={{fontSize:11,marginBottom:12}}>Used only for password recovery. Never shown on the board.</div>
+        </React.Fragment>
+      : <React.Fragment>
+          <label className="lb">Username</label>
+          <input className="f" style={{marginBottom:8}} autoCapitalize="none" value={uname} placeholder="e.g. abu_darda" onChange={e=>setUname(e.target.value)}/>
+          <div style={{background:"#FBF3DF",border:"1px solid #E6D39B",color:"#7A5B12",borderRadius:8,padding:"10px 12px",fontSize:12,lineHeight:1.5,marginBottom:10}}>
+            <b>Please read.</b> With no email there is <b>no way to recover your password</b> if you forget it — your account and all progress would be lost permanently.
+            <label style={{display:"flex",alignItems:"flex-start",gap:8,marginTop:8}}>
+              <input type="checkbox" checked={ack} onChange={e=>setAck(e.target.checked)} style={{marginTop:3}}/>
+              <span>I understand my password cannot be recovered.</span>
+            </label>
+          </div>
+        </React.Fragment>}
+    <label className="lb">Password</label>
+    <input className="f" type="password" value={pw} onChange={e=>setPw(e.target.value)}/>
+    {err && <div style={{color:"var(--danger)",fontSize:12,marginTop:10}}>{err}</div>}
+    <button className="btn primary" style={{marginTop:14}} disabled={busy} onClick={go}>{busy?"…":"Create account & keep my progress"}</button>
+  </div>);
+}
+
 function AccountCard(props){
   const {s,acc}=props;const [editing,setEditing]=useState(false);const [name,setName]=useState(s.name);
   return(<div className="card">
@@ -735,7 +1025,9 @@ function AccountCard(props){
           <button className="btn sm" onClick={()=>{setName(s.name);setEditing(false);}}>Cancel</button>
         </div>
       : <div className="muted" style={{fontSize:13,marginBottom:10}}>Name: <b style={{color:"var(--text)"}}>{s.name}</b>
+          {s.username && <span> · @{s.username}</span>}
           {acc.email && <span> · {acc.email}</span>}
+          {acc.isGuest && <span style={{color:"var(--brass)"}}> · guest</span>}
           <button className="link" style={{marginLeft:10}} onClick={()=>setEditing(true)}>Edit name</button></div>}
     <div className="row" style={{gap:8,flexWrap:"wrap"}}>
       <button className="btn sm" onClick={acc.onExport}>Export backup</button>
